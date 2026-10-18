@@ -2,8 +2,8 @@ name: outage-bot
 
 on:
   # Розклад увімкніть на кроці 8: приберіть # з пробілом на двох рядках нижче
-  # schedule:
-  #   - cron: '3,13,23,33,43,53 * * * *'
+  schedule:
+    - cron: '3,13,23,33,43,53 * * * *'
   workflow_dispatch:
     inputs:
       mode:
