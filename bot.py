@@ -121,11 +121,29 @@ def fetch_list():
 
 def parse_rows(url):
     """{'1.2': [[960, 1080], [1320, 1440]], ...} для всіх знайдених N.M"""
-    text = get_soup(url).get_text("\n").replace("\xa0", " ")
-    return parse_text(text)
+    text = get_soup(url).get_text("\n")
+    return parse_text_checked(text)
+
+
+GLUE_RE = re.compile(r"(?<![\d.])(\d)\s+(\d)\s*:\s*(\d{2})")
+LABEL_RE = re.compile(r"(?<![\d.])([1-6])\.([12])(?=\s+\d)")
+
+
+def normalize(text):
+    """Склеює розірваний час: '0 0 :00' -> '00:00', '10 :00' -> '10:00'."""
+    text = text.replace("\xa0", " ")
+    return GLUE_RE.sub(r"\1\2:\3", text)
 
 
 def parse_text(text):
+    rows, _ = parse_text_checked(text)
+    return rows
+
+
+def parse_text_checked(text):
+    """Повертає (rows, ok). ok=False, якщо на сторінці є рядки N.M,
+    які не вдалося розібрати (тоді графік публікувати не можна)."""
+    text = normalize(text)
     s = text.find("Години відсутності")
     if s != -1:
         text = text[s:]
@@ -136,7 +154,8 @@ def parse_text(text):
     for q, sub, times in ROW_RE.findall(text):
         rows[f"{q}.{sub}"] = sorted(
             [to_min(a), to_min(b)] for a, b in SLOT_RE.findall(times))
-    return rows
+    labels = {f"{q}.{m}" for q, m in LABEL_RE.findall(text)}
+    return rows, labels <= set(rows)
 
 
 # ---------------- порівняння ----------------
@@ -269,8 +288,8 @@ def main():
         if url in seen:
             continue
         date = DATE_RE.search(item["title"]).group(1).lower()
-        rows = parse_rows(url)
-        if len(rows) < MIN_ROWS:                  # формат змінився: не мовчимо
+        rows, ok = parse_rows(url)
+        if len(rows) < MIN_ROWS or not ok:        # формат змінився: не мовчимо
             if not SEED:
                 send(f"⚡ <b>{html.escape(item['title'])}</b>\n"
                      f"Не вдалося автоматично розібрати графік.\n"
