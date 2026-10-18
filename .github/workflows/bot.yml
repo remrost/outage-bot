@@ -1,0 +1,58 @@
+name: outage-bot
+
+on:
+  # Розклад увімкніть на кроці 8: приберіть # з пробілом на двох рядках нижче
+  # schedule:
+  #   - cron: '3,13,23,33,43,53 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Режим запуску'
+        type: choice
+        default: normal
+        options:
+          - normal
+          - seed
+          - dry
+
+permissions:
+  contents: write
+
+concurrency:
+  group: outage-bot
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run bot
+        run: python bot.py
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          SEED: ${{ github.event.inputs.mode == 'seed' && '1' || '' }}
+          DRY_RUN: ${{ github.event.inputs.mode == 'dry' && '1' || '' }}
+
+      - name: Save state
+        if: github.event.inputs.mode != 'dry'
+        run: |
+          git config user.name 'outage-bot'
+          git config user.email 'outage-bot@users.noreply.github.com'
+          if [ -f state.json ]; then git add state.json; fi
+          if ! git diff --cached --quiet; then
+            git commit -m 'state'
+            git push
+          elif [ $(( $(date +%s) - $(git log -1 --format=%ct) )) -gt 2592000 ]; then
+            git commit --allow-empty -m 'keepalive'
+            git push
+          fi
