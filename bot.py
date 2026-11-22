@@ -29,6 +29,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (outage-bot)"}
 TZ = ZoneInfo("Europe/Kyiv")
 
 SHOW_SOURCE = False          # True = додавати рядок «Джерело: Черкасиобленерго»
+PARSER_VERSION = 2          # змінюйте при зміні алгоритму розбору: збережені розклади скинуться
 MIN_ROWS = 6                 # мінімум розпізнаних рядків N.M, щоб довіряти розбору
 INV = "\u2800"               # «невидимий» символ для інтервалів між рядками
 
@@ -86,15 +87,18 @@ def load_state():
         d = {}
     if isinstance(d, list):                       # старий формат
         d = {"seen": d}
-    return set(d.get("seen", [])), d.get("schedules", {})
+    scheds = d.get("schedules", {})
+    if d.get("parser") != PARSER_VERSION:         # розклади збережені старим алгоритмом
+        scheds = {}                               # не порівнюємо з ними (seen лишається)
+    return set(d.get("seen", [])), scheds
 
 
 def save_state(seen, scheds):
     while len(scheds) > 10:                       # лишаємо останні дати
         scheds.pop(next(iter(scheds)))
     with open(STATE, "w", encoding="utf-8") as f:
-        json.dump({"seen": sorted(seen), "schedules": scheds},
-                  f, ensure_ascii=False)
+        json.dump({"seen": sorted(seen), "schedules": scheds,
+                   "parser": PARSER_VERSION}, f, ensure_ascii=False)
 
 
 # ---------------- сайт ----------------
@@ -140,20 +144,40 @@ def parse_text(text):
     return rows
 
 
+HEADER_RE = re.compile(r"Години\s+відсутності", re.I)
+# Початок ДРУГОГО списку (окремі графіки для філій) або кінець блоку з графіком.
+# Перший список (по області) береться повністю, усе, що йде за цими ознаками, ігнорується.
+END_RE = re.compile(
+    r"Тимчасові\s+індивідуальні"       # заголовок другого списку
+    r"|індивідуальні\s+графіки"         # запасне формулювання
+    r"|Години\s+відсутності"            # повторний заголовок = другий список
+    r"|Свою\s+чергу",                   # кінець блоку в старому форматі
+    re.I)
+
+
+def first_list(text):
+    """Лишає лише перший список графіка (по області).
+    Старий формат (один список) повертається без змін."""
+    m = HEADER_RE.search(text)
+    if m:
+        text = text[m.start():]
+        e = END_RE.search(text, m.end() - m.start())   # шукаємо після першого заголовка
+    else:
+        e = END_RE.search(text)
+    return text[:e.start()] if e else text
+
+
 def parse_text_checked(text):
     """Повертає (rows, ok). ok=False, якщо на сторінці є рядки N.M,
     які не вдалося розібрати (тоді графік публікувати не можна)."""
-    text = normalize(text)
-    s = text.find("Години відсутності")
-    if s != -1:
-        text = text[s:]
-    e = text.find("Свою чергу")
-    if e != -1:
-        text = text[:e]
+    text = first_list(normalize(text))
     rows = {}
-    for q, sub, times in ROW_RE.findall(text):
-        rows[f"{q}.{sub}"] = sorted(
-            [to_min(a), to_min(b)] for a, b in SLOT_RE.findall(times))
+    for m in ROW_RE.finditer(text):
+        key = f"{m.group(1)}.{m.group(2)}"
+        if key in rows:        # мітка повторилась: далі йде інший список
+            break
+        rows[key] = sorted(
+            [to_min(a), to_min(b)] for a, b in SLOT_RE.findall(m.group(3)))
     labels = {f"{q}.{m}" for q, m in LABEL_RE.findall(text)}
     return rows, labels <= set(rows)
 
