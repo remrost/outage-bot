@@ -44,7 +44,7 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.mode == 'dry' && '1' || '' }}
 
       - name: Save state
-        if: github.event.inputs.mode != 'dry'
+        if: ${{ !cancelled() && github.event.inputs.mode != 'dry' }}
         run: |
           git config user.name 'outage-bot'
           git config user.email 'outage-bot@users.noreply.github.com'
