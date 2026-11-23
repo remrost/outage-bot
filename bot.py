@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Публікація графіків ГПВ (підчерги N.2) із сайту Черкасиобленерго в Telegram-канал.
+"""Публікація графіків ГПВ (підчерги N.2) у Telegram-канал.
+
+Джерела: Telegram-канал Черкасиобленерго (основне, виходить раніше) і сайт (запасне).
+Одна й та сама версія графіка публікується один раз, хто б із джерел її не показав першим.
 
 Змінні середовища:
   BOT_TOKEN  токен бота від @BotFather
@@ -11,8 +14,10 @@ import os
 import re
 import json
 import html
+import hashlib
+import time
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
@@ -20,6 +25,8 @@ from bs4 import BeautifulSoup
 
 # ---------------- налаштування ----------------
 LIST_URL = "https://www.cherkasyoblenergo.com/media?category=news&lang=uk"
+TG_NAME = "pat_cherkasyoblenergo"
+TG_URL = f"https://t.me/s/{TG_NAME}"
 TOKEN = os.environ.get("BOT_TOKEN")
 CHAT = os.environ.get("CHAT_ID")
 SEED = os.environ.get("SEED") == "1"
@@ -79,6 +86,14 @@ def day_start(date, now):
 
 
 # ---------------- стан ----------------
+KEEP_DATES = 10              # скільки останніх дат тримати в стані
+KEEP_VERSIONS = 12           # скільки версій графіка на дату пам'ятати
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
 def load_state():
     try:
         with open(STATE, encoding="utf-8") as f:
@@ -87,25 +102,48 @@ def load_state():
         d = {}
     if isinstance(d, list):                       # старий формат
         d = {"seen": d}
-    scheds = d.get("schedules", {})
+    st = {"seen": set(d.get("seen", [])),
+          "schedules": d.get("schedules", {}),    # дата -> останній графік
+          "versions": d.get("versions", {}),      # дата -> відбитки вже оброблених версій
+          "times": d.get("times", {}),            # дата -> час публікації останньої версії (UTC)
+          "tg_ready": bool(d.get("tg_ready", False))}
     if d.get("parser") != PARSER_VERSION:         # розклади збережені старим алгоритмом
-        scheds = {}                               # не порівнюємо з ними (seen лишається)
-    return set(d.get("seen", [])), scheds
+        st["schedules"], st["versions"], st["times"] = {}, {}, {}   # seen лишається
+    return st
 
 
-def save_state(seen, scheds):
-    while len(scheds) > 10:                       # лишаємо останні дати
+def save_state(st):
+    scheds = st["schedules"]
+    while len(scheds) > KEEP_DATES:               # лишаємо останні дати
         scheds.pop(next(iter(scheds)))
+    for k in ("versions", "times"):
+        for date in [x for x in st[k] if x not in scheds]:
+            del st[k][date]
     with open(STATE, "w", encoding="utf-8") as f:
-        json.dump({"seen": sorted(seen), "schedules": scheds,
-                   "parser": PARSER_VERSION}, f, ensure_ascii=False)
+        json.dump({"seen": sorted(st["seen"]), "schedules": scheds,
+                   "versions": st["versions"], "times": st["times"],
+                   "tg_ready": st["tg_ready"], "parser": PARSER_VERSION},
+                  f, ensure_ascii=False)
+
+
+def digest(rows):
+    """Відбиток версії графіка: однакові дані з різних джерел дають однаковий відбиток."""
+    return hashlib.md5(json.dumps(rows, sort_keys=True).encode()).hexdigest()[:12]
 
 
 # ---------------- сайт ----------------
 def get_soup(url):
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    return BeautifulSoup(r.text, "html.parser")
+    """Завантажує сторінку; при збої мережі робить до 3 спроб."""
+    for attempt in (1, 2, 3):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            return BeautifulSoup(r.text, "html.parser")
+        except requests.RequestException as e:
+            if attempt == 3:
+                raise
+            log(f"Помилка завантаження ({e.__class__.__name__}), спроба {attempt}/3, повтор")
+            time.sleep(2 * attempt)
 
 
 def fetch_list():
@@ -123,10 +161,26 @@ def fetch_list():
             if TITLE_RE.search(v["title"]) and DATE_RE.search(v["title"])]
 
 
+PUB_RE = re.compile(r"(?<![\d.])(\d{2})\.(\d{2})\.(\d{4})\s+(\d{1,2}):(\d{2})")
+
+
+def parse_published(text):
+    """Дата публікації зі сторінки новини («21.11.2026 23:02») за київським часом."""
+    m = PUB_RE.search(text)
+    if not m:
+        return None
+    d, mo, y, h, mi = map(int, m.groups())
+    try:
+        return datetime(y, mo, d, h, mi, tzinfo=TZ)
+    except ValueError:
+        return None
+
+
 def parse_rows(url):
-    """{'1.2': [[960, 1080], [1320, 1440]], ...} для всіх знайдених N.M"""
+    """({'1.2': [[960, 1080], ...], ...}, ok, час публікації) зі сторінки новини"""
     text = get_soup(url).get_text("\n")
-    return parse_text_checked(text)
+    rows, ok = parse_text_checked(text)
+    return rows, ok, parse_published(text)
 
 
 GLUE_RE = re.compile(r"(?<![\d.])(\d)\s+(\d)\s*:\s*(\d{2})")
@@ -180,6 +234,54 @@ def parse_text_checked(text):
             [to_min(a), to_min(b)] for a, b in SLOT_RE.findall(m.group(3)))
     labels = {f"{q}.{m}" for q, m in LABEL_RE.findall(text)}
     return rows, labels <= set(rows)
+
+
+# ---------------- Telegram-канал Черкасиобленерго ----------------
+TG_DATE_RE = re.compile(
+    rf"(\d{{1,2}}\s+(?:{'|'.join(MONTHS)}))\s+з\s+\d{{1,2}}\s*:\s*\d{{2}}", re.I)
+
+
+def fetch_tg():
+    """Останні пости каналу з веб-перегляду t.me/s/<канал> (потрібен відкритий перегляд)."""
+    soup = get_soup(TG_URL)
+    msgs = soup.select("div.tgme_widget_message[data-post]")
+    if not msgs:
+        raise RuntimeError("на сторінці Telegram немає повідомлень "
+                           "(змінилася розмітка або веб-перегляд каналу вимкнено)")
+    out = []
+    for w in msgs:
+        node = w.select_one("div.tgme_widget_message_text")
+        if node is None:                          # фото/відео без тексту
+            continue
+        when = None
+        t = w.select_one("a.tgme_widget_message_date time")
+        if t is not None and t.get("datetime"):
+            try:
+                when = datetime.fromisoformat(t["datetime"])
+            except ValueError:
+                pass
+        post = w["data-post"]
+        out.append({"key": f"tg:{post}", "url": f"https://t.me/{post}",
+                    "text": node.get_text("\n"), "time": when})
+    return out
+
+
+def tg_post(m, now):
+    """Пост Telegram -> пост для обробки; None, якщо це не графік ГПВ (наприклад, ГОП)."""
+    head = m["text"][:500]
+    if not TITLE_RE.search(head):
+        return None
+    if not ROW_RE.search(normalize(m["text"])):   # немає рядків N.M: інформаційний пост
+        return None
+    d = DATE_RE.search(head) or TG_DATE_RE.search(head)
+    if not d:
+        log(f"[telegram] {m['url']}: це ГПВ, але дату не знайдено, пропускаю")
+        return None
+    rows, ok = parse_text_checked(m["text"])
+    first = m["text"].strip().split("\n")[0][:120]
+    return {"src": "telegram", "key": m["key"], "url": m["url"], "title": first,
+            "date": d.group(1).lower(), "rows": rows, "ok": ok,
+            "time": m["time"] or now}
 
 
 # ---------------- порівняння ----------------
@@ -292,43 +394,126 @@ def send(text):
         print(text)
         print("\n" + "=" * 60 + "\n")
         return
-    r = requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data={"chat_id": CHAT, "text": text, "parse_mode": "HTML",
-              "link_preview_options": json.dumps({"is_disabled": True})},
-        timeout=30)
-    if not r.ok:
-        print("Помилка Telegram:", r.status_code, r.text)
-        r.raise_for_status()
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    data = {"chat_id": CHAT, "text": text, "parse_mode": "HTML",
+            "link_preview_options": json.dumps({"is_disabled": True})}
+    for attempt in (1, 2, 3):
+        try:
+            r = requests.post(url, data=data, timeout=30)
+        except requests.exceptions.ConnectionError as e:   # збій з'єднання (повідомлення не доставлено)
+            if attempt == 3:
+                raise
+            log(f"Telegram: помилка з'єднання ({e.__class__.__name__}), спроба {attempt}/3, повтор")
+            time.sleep(3 * attempt)
+            continue
+        if attempt < 3 and (r.status_code == 429 or r.status_code >= 500):
+            try:
+                wait = int(r.json().get("parameters", {}).get("retry_after", 5))
+            except Exception:
+                wait = 5
+            log(f"Telegram: відповідь {r.status_code}, спроба {attempt}/3, повтор через {min(wait, 30)} с")
+            time.sleep(min(wait, 30))
+            continue
+        if not r.ok:
+            print("Помилка Telegram:", r.status_code, r.text)
+            r.raise_for_status()
+        return
 
 
 # ---------------- головна логіка ----------------
+def process(st, p, now):
+    """Один пост (із сайту або Telegram): опублікувати повний графік чи зміни."""
+    date, rows, when = p["date"], p["rows"], p["time"]
+    lag = max(0, int((now - when).total_seconds() // 60))
+    tag = f"[{p['src']}] {p['title']} ({date}), пост від {when.astimezone(TZ):%d.%m %H:%M}, виявлено через {lag} хв"
+    if len(rows) < MIN_ROWS or not p["ok"]:
+        if p["src"] == "site" and not SEED:       # формат змінився: не мовчимо
+            send(f"⚡ <b>{html.escape(p['title'])}</b>\n"
+                 f"Не вдалося автоматично розібрати графік.\n"
+                 f'<a href="{p["url"]}">Відкрити</a>')
+            log(tag + " -> не розібрано, надіслано попередження")
+        else:
+            log(tag + " -> не розібрано, пропущено (сайт покриє)")
+        return
+    h = digest(rows)
+    versions = st["versions"].setdefault(date, [])
+    last = st["times"].get(date)
+    if h in versions:
+        log(tag + " -> ця версія вже оброблена, пропущено")
+        return
+    if last and when < datetime.fromisoformat(last) - timedelta(minutes=2):
+        log(tag + " -> старіша за вже оброблену, пропущено")
+        return
+    old = st["schedules"].get(date)
+    sent = False
+    if not SEED:
+        msg = (build_full(p, date, rows) if old is None
+               else build_update(p, date, old, rows))
+        if msg:
+            send(msg)
+            sent = True
+    st["schedules"][date] = rows                  # нова база для порівнянь
+    versions.append(h)
+    del versions[:-KEEP_VERSIONS]
+    st["times"][date] = when.astimezone(timezone.utc).isoformat()
+    log(tag + (" -> опубліковано" if sent else
+               " -> запам'ятовано" if SEED else " -> змін, які варто публікувати, немає"))
+
+
 def main():
     if not DRY_RUN and not (TOKEN and CHAT):
         raise SystemExit("Задайте змінні середовища BOT_TOKEN і CHAT_ID")
-    seen, scheds = load_state()
-    for item in reversed(fetch_list()):           # від старих до нових
-        url = item["url"]
-        if url in seen:
-            continue
-        date = DATE_RE.search(item["title"]).group(1).lower()
-        rows, ok = parse_rows(url)
-        if len(rows) < MIN_ROWS or not ok:        # формат змінився: не мовчимо
-            if not SEED:
-                send(f"⚡ <b>{html.escape(item['title'])}</b>\n"
-                     f"Не вдалося автоматично розібрати графік.\n"
-                     f'<a href="{url}">Відкрити</a>')
+    st = load_state()
+    seen = st["seen"]
+    now = datetime.now(TZ)
+    posts, ok_sources, dirty = [], 0, False
+
+    try:                                          # сайт (від старих до нових)
+        for item in reversed(fetch_list()):
+            if item["url"] in seen:
+                continue
+            rows, ok, when = parse_rows(item["url"])
+            posts.append({"src": "site", "key": item["url"], "url": item["url"],
+                          "title": item["title"],
+                          "date": DATE_RE.search(item["title"]).group(1).lower(),
+                          "rows": rows, "ok": ok, "time": when or now})
+        ok_sources += 1
+    except Exception as e:
+        log(f"[сайт] недоступний: {e!r}")
+
+    try:                                          # Telegram-канал
+        tg = fetch_tg()
+        ok_sources += 1
+        if not st["tg_ready"] and not DRY_RUN:
+            # перший запуск: лише запам'ятати наявні пости, щоб не публікувати старе
+            seen.update(m["key"] for m in tg)
+            st["tg_ready"] = dirty = True
+            log(f"[telegram] перший запуск: запам'ятовано {len(tg)} постів, нічого не опубліковано")
         else:
-            old = scheds.get(date)
-            if not SEED:
-                msg = (build_full(item, date, rows) if old is None
-                       else build_update(item, date, old, rows))
-                if msg:
-                    send(msg)
-            scheds[date] = rows                   # нова база для порівнянь
-        seen.add(url)
+            for m in tg:
+                if m["key"] in seen:
+                    continue
+                p = tg_post(m, now)
+                if p is None:
+                    seen.add(m["key"])            # не графік ГПВ
+                    dirty = True
+                else:
+                    posts.append(p)
+    except Exception as e:
+        log(f"[telegram] недоступний: {e!r}")
+
+    if ok_sources == 0:
+        raise SystemExit("Жодне з джерел не відповіло")
+
+    posts.sort(key=lambda x: x["time"])           # від старих до нових
+    for p in posts:
+        process(st, p, now)
+        seen.add(p["key"])
         if not DRY_RUN:
-            save_state(seen, scheds)
+            save_state(st)
+            dirty = False
+    if dirty and not DRY_RUN:
+        save_state(st)
 
 
 if __name__ == "__main__":
