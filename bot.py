@@ -9,6 +9,9 @@
   CHAT_ID    @username каналу або числовий ID (-100...)
   SEED=1     лише запам'ятати поточні пости, нічого не публікувати
   DRY_RUN=1  показати повідомлення в консолі, не надсилати й не зберігати стан
+  VIBER_TEST=1  пробна публікація у Viber: два зразки оформлення (графік і зміни), без Telegram
+  VIBER_TOKEN, VIBER_FROM  (необов'язково) токен Viber-каналу та id відправника:
+             якщо задані, ті самі графіки публікуються й у Viber (в іншому оформленні)
 """
 import os
 import re
@@ -29,6 +32,10 @@ TG_NAME = "pat_cherkasyoblenergo"
 TG_URL = f"https://t.me/s/{TG_NAME}"
 TOKEN = os.environ.get("BOT_TOKEN")
 CHAT = os.environ.get("CHAT_ID")
+VIBER_TOKEN = os.environ.get("VIBER_TOKEN")
+VIBER_FROM = os.environ.get("VIBER_FROM")
+VIBER_ON = bool(VIBER_TOKEN and VIBER_FROM)
+VIBER_TEST = os.environ.get("VIBER_TEST") == "1"
 SEED = os.environ.get("SEED") == "1"
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
@@ -49,6 +56,14 @@ FOOTER = [
     INV,
     '✅ <a href="https://t.me/Chyhyryn_bot">Повідомити новину</a>',
 ]
+
+# ---- оформлення для Viber (Telegram-повідомлення не змінюються) ----
+V_ICON_FULL = "💡"      # заголовок графіка
+V_ICON_UPDATE = "🔄"    # заголовок змін до графіка
+V_ICON_OFF = "🔌"       # рядок з інтервалами вимкнення
+VIBER_BOLD = True       # True = заголовки й «N черга:» жирним (*текст*)
+V_SPACER = ""           # проміжок між блоками; якщо Viber стискає порожні рядки – поставте INV
+VIBER_QUEUE_HOURS = 12  # скільки годин повторювати невдалу публікацію у Viber
 
 MONTHS = {"січня": 1, "лютого": 2, "березня": 3, "квітня": 4, "травня": 5,
           "червня": 6, "липня": 7, "серпня": 8, "вересня": 9, "жовтня": 10,
@@ -106,7 +121,8 @@ def load_state():
           "schedules": d.get("schedules", {}),    # дата -> останній графік
           "versions": d.get("versions", {}),      # дата -> відбитки вже оброблених версій
           "times": d.get("times", {}),            # дата -> час публікації останньої версії (UTC)
-          "tg_ready": bool(d.get("tg_ready", False))}
+          "tg_ready": bool(d.get("tg_ready", False)),
+          "viber_queue": d.get("viber_queue", [])}   # невдалі публікації у Viber
     if d.get("parser") != PARSER_VERSION:         # розклади збережені старим алгоритмом
         st["schedules"], st["versions"], st["times"] = {}, {}, {}   # seen лишається
     return st
@@ -122,7 +138,8 @@ def save_state(st):
     with open(STATE, "w", encoding="utf-8") as f:
         json.dump({"seen": sorted(st["seen"]), "schedules": scheds,
                    "versions": st["versions"], "times": st["times"],
-                   "tg_ready": st["tg_ready"], "parser": PARSER_VERSION},
+                   "tg_ready": st["tg_ready"], "viber_queue": st["viber_queue"],
+                   "parser": PARSER_VERSION},
                   f, ensure_ascii=False)
 
 
@@ -388,6 +405,89 @@ def build_update(item, date, old, new, now=None):
     return "\n".join(parts + FOOTER)
 
 
+# ---------------- повідомлення для Viber ----------------
+def vb(text):
+    return f"*{text}*" if VIBER_BOLD else text
+
+
+def viber_list_lines(rows):
+    out = []
+    for q in range(1, 7):
+        sl = rows.get(f"{q}.2")
+        if sl:                            # черг без даних не виводимо
+            out += [vb(f"{q} черга:"),
+                    f"{V_ICON_OFF} " + ", ".join(span(a, b) for a, b in sl), V_SPACER]
+    return out
+
+
+def build_viber_full(date, rows):
+    head = f"{V_ICON_FULL} " + vb(f"Графік на {date}")
+    return "\n".join([head, V_SPACER] + viber_list_lines(rows)).rstrip()
+
+
+def build_viber_update(date, rows):
+    head = f"{V_ICON_UPDATE} " + vb(f"Зміни до графіка на {date}")
+    return "\n".join([head, V_SPACER] + viber_list_lines(rows)).rstrip()
+
+
+# ---------------- Viber ----------------
+def viber_post(text):
+    """True, якщо Viber прийняв пост. Мережеві збої й помилки 5xx повторюються."""
+    for attempt in (1, 2, 3):
+        try:
+            r = requests.post("https://chatapi.viber.com/pa/post",
+                              json={"auth_token": VIBER_TOKEN, "from": VIBER_FROM,
+                                    "type": "text", "text": text}, timeout=30)
+            j = r.json()
+        except (requests.RequestException, ValueError) as e:
+            log(f"Viber: помилка ({e.__class__.__name__}), спроба {attempt}/3")
+            if attempt < 3:
+                time.sleep(3 * attempt)
+            continue
+        if j.get("status") == 0:
+            return True
+        log(f"Viber: відмова status={j.get('status')} {j.get('status_message')}")
+        if r.status_code < 500:               # помилка налаштувань – повтор не допоможе
+            return False
+        if attempt < 3:
+            time.sleep(3 * attempt)
+    return False
+
+
+def send_viber(st, text):
+    """Публікація у Viber. Збій Viber ніколи не ламає роботу з Telegram:
+    невдалий пост ставиться в чергу й повторюється при наступних запусках."""
+    if DRY_RUN:
+        print("[VIBER]\n" + text)
+        print("\n" + "=" * 60 + "\n")
+        return
+    if not VIBER_ON:
+        return
+    if not viber_post(text):
+        st["viber_queue"].append(
+            {"t": datetime.now(timezone.utc).isoformat(), "text": text})
+        log("Viber: не вдалося опублікувати, пост у черзі на повтор")
+
+
+def flush_viber_queue(st):
+    """Повторює невдалі публікації за порядком; застарілі (понад VIBER_QUEUE_HOURS) скидає."""
+    if DRY_RUN or not VIBER_ON or not st["viber_queue"]:
+        return False
+    now = datetime.now(timezone.utc)
+    keep = []
+    for item in st["viber_queue"]:
+        if now - datetime.fromisoformat(item["t"]) > timedelta(hours=VIBER_QUEUE_HOURS):
+            log("Viber: застарілий пост із черги скинуто")
+            continue
+        if keep or not viber_post(item["text"]):   # після першої невдачі порядок зберігаємо
+            keep.append(item)
+        else:
+            log("Viber: пост із черги опубліковано")
+    changed = keep != st["viber_queue"]
+    st["viber_queue"] = keep
+    return changed
+
+
 # ---------------- Telegram ----------------
 def send(text):
     if DRY_RUN:
@@ -447,11 +547,15 @@ def process(st, p, now):
     old = st["schedules"].get(date)
     sent = False
     if not SEED:
-        msg = (build_full(p, date, rows) if old is None
-               else build_update(p, date, old, rows))
+        if old is None:
+            msg, vmsg = build_full(p, date, rows), build_viber_full(date, rows)
+        else:
+            msg = build_update(p, date, old, rows)
+            vmsg = build_viber_update(date, rows) if msg else None
         if msg:
             send(msg)
             sent = True
+            send_viber(st, vmsg)
     st["schedules"][date] = rows                  # нова база для порівнянь
     versions.append(h)
     del versions[:-KEEP_VERSIONS]
@@ -460,13 +564,37 @@ def process(st, p, now):
                " -> запам'ятовано" if SEED else " -> змін, які варто публікувати, немає"))
 
 
+def viber_test():
+    """Пробна публікація у Viber: зразки оформлення, нічого не зберігається й не йде в Telegram."""
+    if not DRY_RUN and not VIBER_ON:
+        raise SystemExit("Задайте секрети VIBER_TOKEN і VIBER_FROM")
+    now = datetime.now(TZ)
+    month = next(k for k, v in MONTHS.items() if v == now.month)
+    date = f"{now.day} {month}"
+    sl = [[480, 600], [780, 960], [1140, 1320]]
+    rows = {f"{q}.2": sl for q in range(1, 7)}
+    for text in (build_viber_full(date, rows), build_viber_update(date, rows)):
+        text += "\n\n(тестове повідомлення)"
+        if DRY_RUN:
+            print("[VIBER]\n" + text + "\n" + "=" * 60 + "\n")
+        elif not viber_post(text):
+            raise SystemExit("Viber не прийняв тестовий пост")
+        else:
+            log("Viber: тестовий пост опубліковано")
+
+
 def main():
+    if VIBER_TEST:
+        return viber_test()
     if not DRY_RUN and not (TOKEN and CHAT):
         raise SystemExit("Задайте змінні середовища BOT_TOKEN і CHAT_ID")
     st = load_state()
     seen = st["seen"]
     now = datetime.now(TZ)
     posts, ok_sources, dirty = [], 0, False
+
+    if flush_viber_queue(st) and not DRY_RUN:     # повтор невдалих публікацій у Viber
+        save_state(st)
 
     try:                                          # сайт (від старих до нових)
         for item in reversed(fetch_list()):
