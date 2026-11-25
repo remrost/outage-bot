@@ -14,6 +14,7 @@ on:
           - normal
           - seed
           - dry
+          - viber_test
 
 permissions:
   contents: write
@@ -40,8 +41,11 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          VIBER_TOKEN: ${{ secrets.VIBER_TOKEN }}
+          VIBER_FROM: ${{ secrets.VIBER_FROM }}
           SEED: ${{ github.event.inputs.mode == 'seed' && '1' || '' }}
           DRY_RUN: ${{ github.event.inputs.mode == 'dry' && '1' || '' }}
+          VIBER_TEST: ${{ github.event.inputs.mode == 'viber_test' && '1' || '' }}
 
       - name: Save state
         if: ${{ !cancelled() && github.event.inputs.mode != 'dry' }}
